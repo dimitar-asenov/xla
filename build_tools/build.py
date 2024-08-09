@@ -100,7 +100,9 @@ class DockerImage:
     """Pulls docker image with retries to avoid transient rate limit errors."""
     for _ in range(retries):
       pull_proc = sh(["docker", "pull", self.image_url], check=False)
-      if pull_proc.returncode != 0:
+      if pull_proc.returncode == 0:
+        break  # Don't keep pulling after successful pull.
+      else:
         time.sleep(15)
 
     # write SHA of image to the sponge config
@@ -206,7 +208,7 @@ _DEFAULT_IMAGE = DockerImage(
 
 # TODO(b/338885148): Remove this once the TF containers have cuDNN 9
 _CUDNN_9_IMAGE = DockerImage(
-    image_url="gcr.io/tensorflow-sigs/build@sha256:dddcaf30321e9007103dce75c51b83fea3c06de462fcf41e7c6ae93f37fc3545",
+    image_url="gcr.io/tensorflow-sigs/build@sha256:0a9728e258d7e0e5830d1960a65968ffdc1d138af5441e30948918e0d50ab2c7",
 )
 
 _ARM64_JAX_MULTI_PYTHON_IMAGE = DockerImage(
@@ -245,7 +247,7 @@ _CPU_X86_BUILD = Build(
     repo="openxla/xla",
     docker_image=_DEFAULT_IMAGE,
     configs=("warnings", "nonccl", "rbe_linux_cpu"),
-    target_patterns=_XLA_DEFAULT_TARGET_PATTERNS + ("-//xla/service/gpu/...",),
+    target_patterns=_XLA_DEFAULT_TARGET_PATTERNS,
     build_tag_filters=cpu_x86_tag_filter,
     test_tag_filters=cpu_x86_tag_filter,
     options=_DEFAULT_BAZEL_OPTIONS,
@@ -263,7 +265,7 @@ _CPU_ARM64_BUILD = Build(
     repo="openxla/xla",
     docker_image=_ARM64_JAX_MULTI_PYTHON_IMAGE,
     configs=("warnings", "rbe_cross_compile_linux_arm64_xla", "nonccl"),
-    target_patterns=_XLA_DEFAULT_TARGET_PATTERNS + ("-//xla/service/gpu/...",),
+    target_patterns=_XLA_DEFAULT_TARGET_PATTERNS,
     options={**_DEFAULT_BAZEL_OPTIONS, "build_tests_only": True},
     build_tag_filters=cpu_arm_tag_filter,
     test_tag_filters=cpu_arm_tag_filter,
@@ -331,8 +333,8 @@ _TENSORFLOW_CPU_BUILD = Build(
         "//tensorflow/compiler/...",
         "-//tensorflow/compiler/tf2tensorrt/...",
         "//tensorflow/python/...",
+        "-//tensorflow/python/distribute/...",
         "-//tensorflow/python/compiler/tensorrt/...",
-        "-//tensorflow/python/integration_testing/...",
     ),
     options=dict(
         verbose_failures=True,
@@ -355,8 +357,8 @@ _TENSORFLOW_GPU_BUILD = Build(
         "//tensorflow/compiler/...",
         "-//tensorflow/compiler/tf2tensorrt/...",
         "//tensorflow/python/...",
+        "-//tensorflow/python/distribute/...",
         "-//tensorflow/python/compiler/tensorrt/...",
-        "-//tensorflow/python/integration_testing/...",
     ),
     build_tag_filters=("-no_oss", "+gpu"),
     test_tag_filters=("-no_oss", "+gpu"),

@@ -19,12 +19,14 @@ limitations under the License.
 #include <limits>
 #include <tuple>
 
+#include "absl/log/log.h"
 #include "absl/types/span.h"
 #include "xla/client/xla_builder.h"
-#include "xla/tests/client_library_test_base.h"
+#include "xla/literal.h"
 #include "xla/tests/exhaustive/exhaustive_op_test_utils.h"
 #include "xla/tests/test_macros.h"
 #include "xla/types.h"
+#include "tsl/platform/test.h"
 
 #ifdef __FAST_MATH__
 #error "Can't be compiled with fast math on"
@@ -32,6 +34,7 @@ limitations under the License.
 
 namespace xla {
 namespace exhaustive_op_test {
+namespace {
 
 // T is the Primitive Type of the complex number
 // Test parameter is a tuple containing
@@ -169,7 +172,7 @@ UNARY_TEST_COMPLEX_64(Rsqrt, {
 })
 
 // The current libc++ implementation of the complex tanh function provides
-// less accurate results when the denomenator of a complex tanh is small, due
+// less accurate results when the denominator of a complex tanh is small, due
 // to floating point precision loss. To avoid this issue for complex64 numbers,
 // we cast it to and from a complex128 when computing tanh.
 UNARY_TEST_COMPLEX_64(Tanh, {
@@ -323,5 +326,6 @@ INSTANTIATE_TEST_SUITE_P(
         ::testing::ValuesIn(
             GetFpValuesForMagnitudeExtremeNormals<double>(40000, 2000))));
 
+}  // namespace
 }  // namespace exhaustive_op_test
 }  // namespace xla

@@ -18,20 +18,24 @@ limitations under the License.
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <limits>
-#include <random>
-#include <string>
-#include <tuple>
 #include <type_traits>
 #include <utility>
 
+#include "absl/log/check.h"
+#include "absl/log/log.h"
+#include "absl/types/span.h"
+#include "xla/client/lib/constants.h"
 #include "xla/client/lib/math.h"
 #include "xla/client/xla_builder.h"
-#include "xla/tests/client_library_test_base.h"
+#include "xla/literal.h"
 #include "xla/tests/exhaustive/exhaustive_op_test_utils.h"
+#include "xla/tests/test_macros.h"
 #include "xla/types.h"
-#include "xla/util.h"
+#include "tsl/platform/test.h"
 
 #ifdef __FAST_MATH__
 #error "Can't be compiled with fast math on"
@@ -39,8 +43,7 @@ limitations under the License.
 
 namespace xla {
 namespace exhaustive_op_test {
-
-extern int GetEupVersion();
+namespace {
 
 using Eigen::half;
 
@@ -190,49 +193,15 @@ class Exhaustive32BitOrLessUnaryTest
     : public ExhaustiveUnaryTest<T>,
       public ::testing::WithParamInterface<std::pair<int64_t, int64_t>> {
  public:
-  static constexpr size_t kRandomInputSize = 2048;
-
- public:
-  Exhaustive32BitOrLessUnaryTest()
-      : input_lower_bounder_(0),
-        input_upper_bounder_(0),
-        special_input_bounder_(false),
-        eup_version_(xla::exhaustive_op_test::GetEupVersion()) {}
-
- public:
   // Sets error parameters appropriately for testing tan.
   void SetParamsForTan();
-
-  void SetBounder(const float lower_bounder, const float upper_bounder) {
-    input_lower_bounder_ = lower_bounder;
-    input_upper_bounder_ = upper_bounder;
-    special_input_bounder_ = true;
-  }
-
-  bool IsGpu(const std::string& platform) const { return platform == "CUDA"; }
-  bool IsCpu(const std::string& platform) const { return platform == "Host"; }
-  bool IsTpu(const std::string& platform) const {
-    return !IsGpu(platform) && !IsCpu(platform);
-  }
-  int EupVersion() const { return eup_version_; }
-  bool IsPreV5Tpu(const std::string& platform) const {
-    return IsTpu(platform) && eup_version_ < 2;
-  }
-  bool IsPreV6Tpu(const std::string& platform) const {
-    return IsTpu(platform) && eup_version_ < 3;
-  }
 
  protected:
   using typename ExhaustiveUnaryTest<T>::NativeT;
 
  private:
   int64_t GetInputSize() override {
-    int64_t begin, end;
-    if (special_input_bounder_) {
-      return kRandomInputSize;
-    } else {
-      std::tie(begin, end) = GetParam();
-    }
+    auto [begin, end] = GetParam();
     VLOG(2) << "Checking range [" << begin << ", " << end << ")";
     return end - begin;
   }
@@ -244,20 +213,10 @@ class Exhaustive32BitOrLessUnaryTest
   // the same bit as the type being tested, if needed, and then bitcasted to the
   // type being tested.
   void FillInput(std::array<Literal, 1>* input_literal) override {
-    int64_t begin, end;
-    if (special_input_bounder_) {
-      begin = input_lower_bounder_;
-      end = input_upper_bounder_;
-      FillRandomInput(input_literal, begin, end);
-    } else {
-      std::tie(begin, end) = GetParam();
-      FillNormalInput(input_literal, begin, end);
-    }
-  }
-  void FillNormalInput(std::array<Literal, 1>* input_literal,
-                       const int64_t begin, const int64_t end) {
     using IntegralT =
         typename ExhaustiveOpTestBase<T, 1>::ComponentIntegralNativeT;
+
+    auto [begin, end] = GetParam();
     int64_t input_size = (*input_literal)[0].element_count();
     VLOG(2) << "Checking range [" << begin << ", " << end << ")";
     CHECK_EQ(input_size, end - begin);
@@ -269,26 +228,6 @@ class Exhaustive32BitOrLessUnaryTest
           this->ConvertAndReplaceKnownIncorrectValueWith(input_val, 0);
     }
   }
-
-  void FillRandomInput(std::array<Literal, 1>* input_literal,
-                       const int64_t begin, const int64_t end) {
-    absl::Span<NativeT> input_arr = (*input_literal)[0].data<NativeT>();
-
-    uint32_t size = kRandomInputSize;
-    NativeT inputs[kRandomInputSize];
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_real_distribution<> dist(static_cast<double>(begin),
-                                          static_cast<double>(end));
-    for (uint32_t i = 0; i < size; ++i) {
-      inputs[i] = NativeT(dist(gen));
-      input_arr[i] = inputs[i];
-    }
-  }
-  float input_lower_bounder_;
-  float input_upper_bounder_;
-  bool special_input_bounder_;
-  const int eup_version_;
 };
 
 using ExhaustiveF32UnaryTest = Exhaustive32BitOrLessUnaryTest<F32>;
@@ -398,8 +337,12 @@ UNARY_TEST_FLOAT_32_BITS_OR_LESS(Logistic, {
     };
   }
   EvaluateOp fn = +[](float x) { return 1.0f / (1.0f + std::exp(-x)); };
-  auto range_checker =
-      +[](NativeT actual) { return !(actual < -1 || actual > 1); };
+  auto range_checker = +[](NativeInputs in, NativeT out) {
+    if (Eigen::numext::isnan(in[0])) {
+      return Eigen::numext::isnan(out);
+    }
+    return Eigen::numext::abs(out) <= 1.0f;
+  };
   Run(Logistic, fn, error_spec_gen, range_checker);
 })
 
@@ -525,7 +468,8 @@ UNARY_TEST_FLOAT_32_BITS_OR_LESS(Cosh, {
       return ErrorSpec{.abs_err = 0, .rel_err = 100 * eps};
     };
   }
-  auto range_checker = +[](NativeT actual) { return !(actual < 1); };
+  auto range_checker =
+      +[](NativeInputs in, NativeT actual) { return !(actual < 1); };
   Run(Cosh, std::cosh, error_spec_gen, range_checker);
 })
 
@@ -549,14 +493,18 @@ UNARY_TEST_FLOAT_32_BITS_OR_LESS(Tanh, {
       return ErrorSpec{.abs_err = 5e-4, .rel_err = 0};
     };
   }
-  auto range_checker =
-      +[](NativeT actual) { return !(actual < -1 || actual > 1); };
-  Run(Tanh, std::tanh, error_spec_gen, range_checker);
+  Run(Tanh, std::tanh, error_spec_gen,
+      [](NativeInputs in, NativeT out) -> bool {
+        if (Eigen::numext::isnan(in[0])) {
+          return Eigen::numext::isnan(out);
+        }
+        return Eigen::numext::abs(out) <= 1.0f;
+      });
 })
 
 UNARY_TEST_FLOAT_32_BITS_OR_LESS(Cos, {
   auto range_checker =
-      +[](NativeT actual) { return !(actual < -1 || actual > 1); };
+      +[](NativeInputs in, NativeT out) { return !(out < -1 || out > 1); };
   Run(
       Cos, std::cos,
       +[](NativeT) {
@@ -569,7 +517,7 @@ UNARY_TEST_FLOAT_32_BITS_OR_LESS(Cos, {
 
 UNARY_TEST_FLOAT_32_BITS_OR_LESS(Sin, {
   auto range_checker =
-      +[](NativeT actual) { return !(actual < -1 || actual > 1); };
+      +[](NativeInputs in, NativeT out) { return !(out < -1 || out > 1); };
   Run(
       Sin, std::sin,
       +[](NativeT) {
@@ -664,76 +612,93 @@ UNARY_TEST_FLOAT_32_BITS_OR_LESS(RoundNearestEven, {
   fesetround(curr_direction);
 })
 
+// Can be thought of as an absolute error of `<=
+// |std::numeric_limits<Native>::min()|`.
 template <typename NativeT>
-double reciprocal_abs_error(NativeT val) {
-  double abs_err = 0.0;
+double ReciprocalCpuGpuAbsError(NativeT val) {
+  float output = 1.0f / static_cast<float>(val);
 
-  // For subnormals, we need to set absolute error to the smallest positive
-  // representable value due to hardware implementations that truncate
-  // subnormals to zero.
-  bool is_subnormal_output =
-      std::numeric_limits<NativeT>::denorm_min() <= std::abs(1 / val) &&
-      std::abs(1 / val) <= std::numeric_limits<NativeT>::min();
-  if (is_subnormal_output) {
-    abs_err = std::numeric_limits<NativeT>::min();
+  if (IsSubnormal(output)) {
+    return std::numeric_limits<float>::min();
   }
 
-  return abs_err;
+  return 0.0;
+}
+
+// Can be thought of as an absolute error of `<=
+// |std::numeric_limits<Native>::min()|`.
+template <typename NativeT>
+double ReciprocalTpuAbsError(NativeT val) {
+  float output = 1.0f / static_cast<float>(val);
+
+  // TPU seems to flush subnormals or minimum normal to 0. We set the error to
+  // the minimum normal in these cases.
+  if (IsSubnormalOrMinNormal(output)) {
+    return std::numeric_limits<float>::min();
+  }
+
+  return 0.0;
 }
 
 UNARY_TEST_FLOAT_32_BITS_OR_LESS(Reciprocal, {
   ErrorSpecGen error_spec_gen =
-      +[](NativeT) { return ErrorSpec{.abs_err = 0.0, .rel_err = 0.0}; };
+      +[](NativeT) { return ErrorSpec{.strict_signed_zeros = true}; };
   if (IsCpu(platform_)) {
     error_spec_gen = +[](NativeT val) {
-      return ErrorSpec{.abs_err = reciprocal_abs_error(val), .rel_err = 0.0};
+      return ErrorSpec{.abs_err = ReciprocalCpuGpuAbsError(val),
+                       .strict_signed_zeros = true};
     };
   }
   if (IsGpu(platform_)) {
     error_spec_gen = +[](NativeT val) {
       NativeT eps = std::numeric_limits<NativeT>::epsilon();
-      return ErrorSpec{.abs_err = reciprocal_abs_error(val), .rel_err = eps};
+      return ErrorSpec{.abs_err = ReciprocalCpuGpuAbsError(val),
+                       .rel_err = eps,
+                       .strict_signed_zeros = true};
     };
   }
   if (IsTpu(platform_)) {
     error_spec_gen = +[](NativeT val) {
-      auto abs_err = reciprocal_abs_error(val);
-      if constexpr (std::is_same<NativeT, xla::bfloat16>()) {
-        return ErrorSpec{.abs_err = abs_err, .rel_err = 0.0};
-      } else if constexpr (std::is_same<NativeT, xla::half>()) {
-        // N.B.: Does not require absolute error.
-        return ErrorSpec{.abs_err = 0.0, .rel_err = 0.0};
-      } else if constexpr (std::is_same<NativeT, float>()) {
+      if constexpr (std::is_same_v<NativeT, xla::bfloat16>) {
+        return ErrorSpec{.abs_err = ReciprocalTpuAbsError(val),
+                         .strict_signed_zeros = true};
+      } else if constexpr (std::is_same_v<NativeT, xla::half>) {
+        return ErrorSpec{.strict_signed_zeros = true};
+      } else if constexpr (std::is_same_v<NativeT, float>) {
         NativeT eps = std::numeric_limits<NativeT>::epsilon();
-        return ErrorSpec{.abs_err = abs_err, .rel_err = eps};
+        return ErrorSpec{.abs_err = ReciprocalTpuAbsError(val),
+                         .rel_err = eps,
+                         .strict_signed_zeros = true};
       }
     };
   }
   if (IsPreV6Tpu(platform_)) {
     error_spec_gen = +[](NativeT val) {
-      auto abs_err = reciprocal_abs_error(val);
-      if constexpr (std::is_same<NativeT, xla::bfloat16>()) {
-        return ErrorSpec{.abs_err = abs_err, .rel_err = 0.0};
-      } else if constexpr (std::is_same<NativeT, xla::half>()) {
-        // N.B.: Does not require absolute error.
-        return ErrorSpec{.abs_err = 0.0, .rel_err = 0.0};
-      } else if constexpr (std::is_same<NativeT, float>()) {
+      if constexpr (std::is_same_v<NativeT, xla::bfloat16>) {
+        return ErrorSpec{.abs_err = ReciprocalTpuAbsError(val),
+                         .strict_signed_zeros = true};
+      } else if constexpr (std::is_same_v<NativeT, xla::half>) {
+        return ErrorSpec{.strict_signed_zeros = true};
+      } else if constexpr (std::is_same_v<NativeT, float>) {
         NativeT eps = std::numeric_limits<NativeT>::epsilon();
-        return ErrorSpec{.abs_err = abs_err, .rel_err = 34 * eps};
+        return ErrorSpec{.abs_err = ReciprocalTpuAbsError(val),
+                         .rel_err = 34 * eps,
+                         .strict_signed_zeros = true};
       }
     };
   }
   if (IsPreV5Tpu(platform_)) {
     error_spec_gen = +[](NativeT val) {
-      auto abs_err = reciprocal_abs_error(val);
-      if constexpr (std::is_same<NativeT, xla::bfloat16>()) {
-        return ErrorSpec{.abs_err = abs_err, .rel_err = 0.0};
-      } else if constexpr (std::is_same<NativeT, xla::half>()) {
-        // N.B.: Does not require absolute error.
-        return ErrorSpec{.abs_err = 0.0, .rel_err = 0.0};
-      } else if constexpr (std::is_same<NativeT, float>()) {
+      if constexpr (std::is_same_v<NativeT, xla::bfloat16>) {
+        return ErrorSpec{.abs_err = ReciprocalTpuAbsError(val),
+                         .strict_signed_zeros = true};
+      } else if constexpr (std::is_same_v<NativeT, xla::half>) {
+        return ErrorSpec{.strict_signed_zeros = true};
+      } else if constexpr (std::is_same_v<NativeT, float>) {
         NativeT eps = std::numeric_limits<NativeT>::epsilon();
-        return ErrorSpec{.abs_err = abs_err, .rel_err = 136 * eps};
+        return ErrorSpec{.abs_err = ReciprocalTpuAbsError(val),
+                         .rel_err = 136 * eps,
+                         .strict_signed_zeros = true};
       }
     };
   }
@@ -753,5 +718,6 @@ INSTANTIATE_TEST_SUITE_P(BF16, ExhaustiveBF16UnaryTest,
                          ::testing::Values(std::make_pair(0, 1 << 16)));
 #endif
 
+}  // namespace
 }  // namespace exhaustive_op_test
 }  // namespace xla

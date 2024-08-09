@@ -18,7 +18,6 @@ limitations under the License.
 #include <algorithm>
 #include <cstdint>
 #include <iterator>
-#include <numeric>
 #include <optional>
 #include <ostream>
 #include <sstream>
@@ -28,19 +27,19 @@ limitations under the License.
 #include <vector>
 
 #include "absl/algorithm/container.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/strings/str_join.h"
 #include "absl/types/span.h"
-#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Casting.h"
-#include "mlir/IR/AffineExpr.h"  // from @llvm-project
-#include "mlir/IR/AffineMap.h"  // from @llvm-project
-#include "mlir/IR/MLIRContext.h"  // from @llvm-project
-#include "mlir/Support/LLVM.h"  // from @llvm-project
+#include "mlir/IR/AffineExpr.h"
+#include "mlir/IR/AffineMap.h"
+#include "mlir/IR/MLIRContext.h"
+#include "mlir/Support/LLVM.h"
 #include "xla/service/gpu/model/affine_map_printer.h"
 #include "xla/service/gpu/model/indexing_map.h"
 
@@ -48,6 +47,7 @@ namespace xla {
 namespace gpu {
 namespace {
 
+using ::llvm::SmallVector;
 using ::mlir::AffineConstantExpr;
 using ::mlir::AffineDimExpr;
 using ::mlir::AffineExpr;
@@ -59,37 +59,6 @@ using ::mlir::getAffineDimExpr;
 using ::mlir::MLIRContext;
 using Constraint = ConstraintExpression::Constraint;
 using ConjointConstraints = ConstraintExpression::ConjointConstraints;
-
-// Converts all dimensions to symbols at the same position.
-AffineExpr DimsToSymbols(AffineExpr expr, int64_t num_dimensions) {
-  MLIRContext* ctx = expr.getContext();
-  llvm::SmallVector<int64_t> iota(num_dimensions);
-  std::iota(iota.begin(), iota.end(), 0);
-
-  return expr.replaceDims(llvm::to_vector(llvm::map_range(
-      iota, [&](int64_t i) { return getAffineSymbolExpr(i, ctx); })));
-}
-
-// Gets a modified version of `expressions` where both the original dimensions
-// and symbols are replaced with symbols.
-//
-// (dimensions)[symbols] -> ()[dimensions, symbols]
-std::vector<AffineExpr> DimsToSymbols(std::vector<AffineExpr> expressions,
-                                      const IndexingMap& indexing_map) {
-  // Shift existing symbols to the right such that they end up following the
-  // newly introduced symbols.
-  for (AffineExpr& expression : expressions) {
-    expression =
-        expression.shiftSymbols(/*numSymbols=*/indexing_map.GetSymbolCount(),
-                                /*shift=*/indexing_map.GetDimensionCount());
-  }
-
-  for (AffineExpr& expression : expressions) {
-    expression = DimsToSymbols(expression, indexing_map.GetDimensionCount());
-  }
-
-  return expressions;
-}
 
 // Helper to perform function application to using the same parameter for every
 // dimension and symbol parameter.
@@ -151,14 +120,12 @@ std::optional<SizeAndStrideExpression> ExtractSizeAndStrideFromMod(
   //     = n - (n - c)
   //     = c
   CHECK(modulus.getKind() == AffineExprKind::Constant);
-  if (auto dim_expr = llvm::dyn_cast<mlir::AffineDimExpr>(lhs)) {
-    AffineExpr size =
-        dim_expr - mlir::getAffineBinaryOpExpr(AffineExprKind::FloorDiv,
-                                               dim_expr - 1, modulus) *
-                       modulus;
+  if (auto tile_size_expr = llvm::dyn_cast<mlir::AffineDimExpr>(lhs)) {
+    AffineExpr size = tile_size_expr -
+                      mlir::getAffineBinaryOpExpr(AffineExprKind::FloorDiv,
+                                                  tile_size_expr - 1, modulus) *
+                          modulus;
 
-    AffineExpr tile_size_expr =
-        getAffineSymbolExpr(dim_expr.getPosition(), lhs.getContext());
     Interval zero_interval{/*lower=*/0, /*upper=*/0};
     // TODO(b/349487906): the below also becomes more complicated if stride is
     // not unit.
@@ -338,43 +305,28 @@ void SortByStride(std::vector<SizeAndStrideExpression>& sizes_and_strides,
 
 // Returns the range size of the given size expression.
 //
-// `size` must be a constant or dimension expression by default. If
-// `dimensions_were_converted_to_symbols` is true, then `size` can not be a
-// dimension expression but can be a symbol expression instead.
+// `size` must be a constant or dimension expression.
 std::optional<int64_t> TryGetSizeExpressionRangeSize(
-    AffineExpr size, absl::Span<Interval const> dimension_intervals,
-    bool dimensions_were_converted_to_symbols = false) {
-  std::optional<int64_t> dim_or_symbol_position;
-  if (dimensions_were_converted_to_symbols) {
-    CHECK(size.getKind() == AffineExprKind::Constant ||
-          size.getKind() == AffineExprKind::SymbolId);
-    if (auto symbol = llvm::dyn_cast<AffineSymbolExpr>(size)) {
-      dim_or_symbol_position = symbol.getPosition();
-    }
-  } else {
-    CHECK(size.getKind() == AffineExprKind::Constant ||
-          size.getKind() == AffineExprKind::DimId);
-    if (auto dimension = llvm::dyn_cast<AffineDimExpr>(size)) {
-      dim_or_symbol_position = dimension.getPosition();
-    }
+    AffineExpr size, absl::Span<Interval const> dimension_intervals) {
+  if (size.getKind() == AffineExprKind::Constant) {
+    return llvm::cast<AffineConstantExpr>(size).getValue();
   }
-  if (dim_or_symbol_position.has_value()) {
-    const Interval& interval = dimension_intervals.at(*dim_or_symbol_position);
-    if (interval.lower != 0) {
-      // TODO(bchetioui): I think we may need to handle this to have reshapes
-      // working well with concatenations. Nevertheless, we can take a look
-      // later.
-      VLOG(1) << "Attempted to combine strides but got dimension "
-              << AffineMapPrinter().ToString(size) << " with lower bound "
-              << interval.lower << " != 0";
-      return std::nullopt;
-    }
-    // We need to add 1 to the upper bound of the interval to describe the
-    // number of elements being captured, since the interval bounds are
-    // inclusive.
-    return interval.upper + 1;
+  CHECK(size.getKind() == AffineExprKind::DimId);
+  auto dim_position = llvm::dyn_cast<AffineDimExpr>(size).getPosition();
+  const Interval& interval = dimension_intervals.at(dim_position);
+  if (interval.lower != 0) {
+    // TODO(bchetioui): I think we may need to handle this to have reshapes
+    // working well with concatenations. Nevertheless, we can take a look
+    // later.
+    VLOG(1) << "Attempted to combine strides but got dimension "
+            << AffineMapPrinter().ToString(size) << " with lower bound "
+            << interval.lower << " != 0";
+    return std::nullopt;
   }
-  return llvm::cast<AffineConstantExpr>(size).getValue();
+  // We need to add 1 to the upper bound of the interval to describe the
+  // number of elements being captured, since the interval bounds are
+  // inclusive.
+  return interval.upper + 1;
 };
 
 // Given a list of sizes and strides, combines the strides into a single
@@ -499,10 +451,10 @@ std::optional<AffineExpr> CombineStrides(
 // `ConstructConstraintExpressionForDestructuredSummation` for broader context.
 std::optional<ConjointConstraints>
 TryConstructSingleConjointConstraintForDestructuredSummation(
-    absl::Span<AffineExpr const> sizes,
+    absl::Span<SizeAndStrideExpression const> sizes_and_strides,
     absl::Span<Interval const> dimension_intervals, int64_t partial_dim_index,
     int64_t num_full_dims) {
-  CHECK(partial_dim_index + num_full_dims <= sizes.size());
+  CHECK_LE(partial_dim_index + num_full_dims, sizes_and_strides.size());
 
   ConjointConstraints constraints;
   Interval one = Interval{/*lower=*/1, /*upper=*/1};
@@ -510,7 +462,8 @@ TryConstructSingleConjointConstraintForDestructuredSummation(
 
   // Add leading ones.
   while (running_size_index < partial_dim_index) {
-    constraints.push_back(Constraint{sizes[running_size_index], one});
+    constraints.push_back(
+        Constraint{sizes_and_strides[running_size_index].size, one});
     ++running_size_index;
   }
 
@@ -519,10 +472,9 @@ TryConstructSingleConjointConstraintForDestructuredSummation(
 
   // Add full dimensions.
   while (running_size_index <= partial_dim_index + num_full_dims) {
-    AffineExpr size_expr = sizes[running_size_index];
-    std::optional<int64_t> max_size = TryGetSizeExpressionRangeSize(
-        size_expr, dimension_intervals,
-        /*dimensions_were_converted_to_symbols=*/true);
+    AffineExpr size_expr = sizes_and_strides[running_size_index].size;
+    std::optional<int64_t> max_size =
+        TryGetSizeExpressionRangeSize(size_expr, dimension_intervals);
     if (!max_size.has_value()) {
       return std::nullopt;
     }
@@ -532,8 +484,9 @@ TryConstructSingleConjointConstraintForDestructuredSummation(
   }
 
   // Add trailing ones.
-  while (running_size_index < sizes.size()) {
-    constraints.push_back(Constraint{sizes[running_size_index], one});
+  while (running_size_index < sizes_and_strides.size()) {
+    constraints.push_back(
+        Constraint{sizes_and_strides[running_size_index].size, one});
     ++running_size_index;
   }
 
@@ -573,16 +526,6 @@ ConstraintExpression ConstructConstraintExpressionForDestructuredSummation(
   SortByStride(sizes_and_strides, /*reverse=*/true);
   ConstraintExpression result;
 
-  int64_t num_dimension_parameters = dimension_intervals.size();
-  std::vector<AffineExpr> sizes_with_symbols;
-  sizes_with_symbols.reserve(num_dimension_parameters);
-  // Use symbols here because constraints operate on the symbols of the
-  // `SymbolicTile`, as explained in the documentation of the class.
-  for (const SizeAndStrideExpression& size_and_stride : sizes_and_strides) {
-    sizes_with_symbols.push_back(
-        DimsToSymbols(size_and_stride.size, num_dimension_parameters));
-  }
-
   int64_t num_components = sizes_and_strides.size();
   for (int64_t partial_dim_index = 0; partial_dim_index < num_components;
        ++partial_dim_index) {
@@ -590,7 +533,7 @@ ConstraintExpression ConstructConstraintExpressionForDestructuredSummation(
          num_full_dims < num_components - partial_dim_index; ++num_full_dims) {
       std::optional<ConjointConstraints> single_conjoint_constraint =
           TryConstructSingleConjointConstraintForDestructuredSummation(
-              sizes_with_symbols, dimension_intervals, partial_dim_index,
+              sizes_and_strides, dimension_intervals, partial_dim_index,
               num_full_dims);
       if (!single_conjoint_constraint.has_value()) {
         // Even if we fail to derive a single conjunction, we can still recover
@@ -659,23 +602,8 @@ std::optional<SizeAndStrideExpression> ExtractSizeAndStride(
     AffineExpr strided_indexing, absl::Span<Interval const> dimension_intervals,
     absl::Span<Interval const> symbol_intervals) {
   MLIRContext* ctx = strided_indexing.getContext();
-  // Deal with the symbol case (capturing a whole untiled dimension).
-  // TODO(b/330906085): concatenating across a reduction dimension needs to be
-  // handled by this code.
-  if (auto symbol = llvm::dyn_cast<AffineSymbolExpr>(strided_indexing)) {
-    const Interval& symbol_interval = symbol_intervals[symbol.getPosition()];
-    if (symbol_interval.lower != 0) {
-      return std::nullopt;
-    }
-
-    return SizeAndStrideExpression(
-        /*size=*/getAffineConstantExpr(symbol_interval.upper + 1, ctx),
-        /*stride=*/getAffineConstantExpr(1, ctx));
-  }
-
   AffineMapPrinter printer;
 
-  // TODO(b/328427138): support multivariate size expressions.
   switch (strided_indexing.getKind()) {
     case AffineExprKind::DimId:
       return SizeAndStrideExpression(/*size=*/strided_indexing,
@@ -683,23 +611,15 @@ std::optional<SizeAndStrideExpression> ExtractSizeAndStride(
     case mlir::AffineExprKind::Mul: {
       const auto mul = llvm::cast<mlir::AffineBinaryOpExpr>(strided_indexing);
       AffineExpr lhs = mul.getLHS();
-      // The stride may not be fully collapsed if it is negative; in that case,
-      // we need to extract the negative multiplier first.
-      if (const auto rhs = llvm::dyn_cast<AffineConstantExpr>(mul.getRHS());
-          rhs && rhs.getValue() == -1) {
-        std::optional<SizeAndStrideExpression> maybe_size_and_stride =
-            ExtractSizeAndStride(lhs, dimension_intervals, symbol_intervals);
-        if (!maybe_size_and_stride.has_value()) {
-          return std::nullopt;
-        }
-
-        return SizeAndStrideExpression(
-            /*size=*/maybe_size_and_stride->size,
-            /*stride=*/maybe_size_and_stride->stride * rhs);
+      std::optional<SizeAndStrideExpression> maybe_size_and_stride =
+          ExtractSizeAndStride(lhs, dimension_intervals, symbol_intervals);
+      if (!maybe_size_and_stride.has_value()) {
+        return std::nullopt;
       }
-      CHECK(lhs.getKind() == AffineExprKind::DimId);
-      return SizeAndStrideExpression(/*size=*/lhs,
-                                     /*stride=*/mul.getRHS());
+
+      return SizeAndStrideExpression(
+          /*size=*/maybe_size_and_stride->size,
+          /*stride=*/maybe_size_and_stride->stride * mul.getRHS());
     }
     case mlir::AffineExprKind::Mod: {
       auto mod = llvm::cast<mlir::AffineBinaryOpExpr>(strided_indexing);
@@ -713,15 +633,18 @@ std::optional<SizeAndStrideExpression> ExtractSizeAndStride(
     case mlir::AffineExprKind::Constant:
       return SizeAndStrideExpression(/*size=*/getAffineConstantExpr(1, ctx),
                                      /*stride=*/getAffineConstantExpr(0, ctx));
-    case mlir::AffineExprKind::SymbolId:
-      VLOG(1) << "Encountered complex size expression involving symbol "
-              << printer.ToString(strided_indexing);
-      // It's currently not checked separately, but RTVars shouldn't appear in
-      // the strided indexing expressions.
-      return std::nullopt;
+    case mlir::AffineExprKind::SymbolId: {
+      auto symbol = llvm::cast<AffineSymbolExpr>(strided_indexing);
+      const Interval& symbol_interval = symbol_intervals[symbol.getPosition()];
+      if (symbol_interval.lower != 0) {
+        return std::nullopt;
+      }
+
+      return SizeAndStrideExpression(
+          /*size=*/getAffineConstantExpr(symbol_interval.upper + 1, ctx),
+          /*stride=*/getAffineConstantExpr(1, ctx));
+    }
     case mlir::AffineExprKind::Add: {
-      // TODO(b/328427138): this should only be necessary in the multivariate
-      // case, and will be implemented later.
       std::optional<std::vector<SizeAndStrideExpression>>
           maybe_sizes_and_strides =
               ExtractSizesAndStridesFromMultivariateSummation(
@@ -986,6 +909,36 @@ SimplifyConjointConstraints(const ConjointConstraints& conjunction) {
   if (result.empty()) {
     return AlwaysSatisfied{};
   }
+
+  // A comparator to canonicalize the order of constraints, so we can easily
+  // check if two ConjointConstraints are equal. The order is arbitrary (doesn't
+  // depend on the structure of the constraints) and can change between runs,
+  // but is stable during a single execution. The printed version of the
+  // constraints relies on sorting strings, so string representation will be
+  // always the same.
+  auto comp = [](const Constraint& a, const Constraint& b) {
+    if (a.expr != b.expr) {
+      // AffineExpr are deduplicated and stored as immutable objects in
+      // MLIRContext. Comparing pointers gives us a fast and easy way to get
+      // stable ordering.
+      CHECK_EQ(a.expr.getContext(), b.expr.getContext())
+          << "AffineExpr should be from the same MLIRContext.";
+      return a.expr.getImpl() < b.expr.getImpl();
+    }
+
+    // Default comparison for intervals will return nullopt if intervals are
+    // overlapping. Here we do strict ordering by comparing lower bounds first
+    // and then upper bounds.
+    if (a.interval.lower != b.interval.lower) {
+      return a.interval.lower < b.interval.lower;
+    }
+
+    return a.interval.upper < b.interval.upper;
+  };
+
+  // Canonicalize constraints order.
+  std::sort(result.begin(), result.end(), comp);
+
   return result;
 }
 
@@ -995,7 +948,8 @@ ConstraintExpression SimplifyConstraintExpression(
       constraint_expression.IsAlwaysSatisfied()) {
     return constraint_expression;
   }
-  auto result = ConstraintExpression::GetUnsatisfiableConstraintExpression();
+
+  SmallVector<ConjointConstraints, 2> simplified_disjoint_conjoint_constraints;
   for (const auto& conjunction :
        constraint_expression.DisjointConjointConstraints()) {
     auto simplified_conjunction = SimplifyConjointConstraints(conjunction);
@@ -1005,8 +959,24 @@ ConstraintExpression SimplifyConstraintExpression(
     if (std::holds_alternative<AlwaysSatisfied>(simplified_conjunction)) {
       return ConstraintExpression();
     }
-    result.Or(std::get<ConjointConstraints>(simplified_conjunction));
+    simplified_disjoint_conjoint_constraints.push_back(
+        std::get<ConjointConstraints>(std::move(simplified_conjunction)));
   }
+
+  // Find and remove redundant constraints.
+  absl::flat_hash_set<ConjointConstraints> unique_conjunctions;
+  for (const auto& conjunction : simplified_disjoint_conjoint_constraints) {
+    if (unique_conjunctions.contains(conjunction)) {
+      continue;
+    }
+    unique_conjunctions.insert(std::move(conjunction));
+  }
+
+  auto result = ConstraintExpression::GetUnsatisfiableConstraintExpression();
+  for (auto& conjoint_constraints : unique_conjunctions) {
+    result.Or(std::move(conjoint_constraints));
+  }
+
   return result;
 }
 
@@ -1096,7 +1066,6 @@ void ConstraintExpression::Simplify() {
 
   // Eliminate negative strides and recalculate offsets.
   // TODO(b/340555497): handle normalization of more complex expressions.
-  std::vector<AffineExpr> dim_replacements, sym_replacements;
   for (auto [offset, size, stride] :
        llvm::zip(offset_expressions, size_expressions, stride_expressions)) {
     auto constant = llvm::dyn_cast<AffineConstantExpr>(stride);
@@ -1149,8 +1118,7 @@ std::string SymbolicTile::RtVarsToString(
     const AffineMapPrinter& printer) const {
   std::string s;
   std::stringstream ss(s);
-  PrintRTVars(tile_map_.GetRTVars(),
-              /*first_rt_var_symbol_index=*/tile_map_.GetDimensionCount(), ss,
+  PrintRTVars(tile_map_.GetRTVars(), /*first_rt_var_symbol_index=*/0, ss,
               printer);
   return ss.str();
 }
@@ -1174,9 +1142,7 @@ void SymbolicTile::Print(std::ostream& out,
   const std::vector<RTVar>& rt_vars = tile_map_.GetRTVars();
   if (!rt_vars.empty()) {
     out << "\n\trt_vars: ";
-    PrintRTVars(rt_vars,
-                /*first_rt_var_symbol_index=*/tile_map_.GetDimensionCount(),
-                out, printer);
+    PrintRTVars(rt_vars, /*first_rt_var_symbol_index=*/0, out, printer);
   }
   if (!constraints_.IsAlwaysSatisfied()) {
     out << "\n\tconstraints: ";
@@ -1190,49 +1156,41 @@ namespace {
 constexpr int kNumComponentsPerTiledDimension = 3;
 }  // namespace
 
-mlir::AffineMap SymbolicTile::offset_map() const {
-  llvm::ArrayRef<AffineExpr> results = tile_map_.GetAffineMap().getResults();
-  CHECK_EQ(results.size() % kNumComponentsPerTiledDimension, 0);
-  llvm::ArrayRef<AffineExpr> offsets(
-      results.begin(),
-      results.begin() + results.size() / kNumComponentsPerTiledDimension);
+AffineMap SymbolicTile::offset_map() const {
+  int64_t num_results = tile_map_.GetAffineMap().getResults().size();
+  CHECK_EQ(num_results % kNumComponentsPerTiledDimension, 0);
+  int64_t component_size = num_results / kNumComponentsPerTiledDimension;
   // RTVars are included in the symbols.
-  return AffineMap::get(
-      /*dimCount=*/0,
-      /*symbolCount=*/tile_map_.GetAffineMap().getNumDims() +
-          tile_map_.GetAffineMap().getNumSymbols(),
-      /*results=*/DimsToSymbols(offsets, tile_map_),
-      /*context=*/tile_map_.GetAffineMap().getContext());
+  return tile_map_.GetAffineMap().getSliceMap(0, component_size);
 }
 
-mlir::AffineMap SymbolicTile::size_map() const {
-  llvm::ArrayRef<AffineExpr> results = tile_map_.GetAffineMap().getResults();
-  CHECK_EQ(results.size() % kNumComponentsPerTiledDimension, 0);
-  llvm::ArrayRef<AffineExpr> offsets(
-      results.begin() + results.size() / kNumComponentsPerTiledDimension,
-      results.begin() + results.size() / kNumComponentsPerTiledDimension * 2);
+AffineMap SymbolicTile::size_map() const {
+  AffineMap affine_map = tile_map_.GetAffineMap();
+  int64_t num_results = affine_map.getResults().size();
+  CHECK_EQ(num_results % kNumComponentsPerTiledDimension, 0);
+  int64_t component_size = num_results / kNumComponentsPerTiledDimension;
+
   // RTVars are *not* included in the symbols.
   return AffineMap::get(
-      /*dimCount=*/0,
-      /*symbolCount=*/tile_map_.GetAffineMap().getNumDims() +
-          tile_map_.GetAffineMap().getNumSymbols() - tile_map_.GetRTVarsCount(),
-      /*results=*/DimsToSymbols(offsets, tile_map_),
-      /*context=*/tile_map_.GetAffineMap().getContext());
+      /*dimCount=*/affine_map.getNumDims(),
+      /*symbolCount=*/affine_map.getNumSymbols() - tile_map_.GetRTVarsCount(),
+      /*results=*/affine_map.getResults().slice(component_size, component_size),
+      /*context=*/affine_map.getContext());
 }
 
-mlir::AffineMap SymbolicTile::stride_map() const {
-  llvm::ArrayRef<AffineExpr> results = tile_map_.GetAffineMap().getResults();
-  CHECK_EQ(results.size() % kNumComponentsPerTiledDimension, 0);
-  llvm::ArrayRef<AffineExpr> offsets(
-      results.begin() + results.size() / kNumComponentsPerTiledDimension * 2,
-      results.end());
+AffineMap SymbolicTile::stride_map() const {
+  AffineMap affine_map = tile_map_.GetAffineMap();
+  int64_t num_results = affine_map.getResults().size();
+  CHECK_EQ(num_results % kNumComponentsPerTiledDimension, 0);
+  int64_t component_size = num_results / kNumComponentsPerTiledDimension;
+
   // RTVars are *not* included in the symbols.
   return AffineMap::get(
-      /*dimCount=*/0,
-      /*symbolCount=*/tile_map_.GetAffineMap().getNumDims() +
-          tile_map_.GetAffineMap().getNumSymbols() - tile_map_.GetRTVarsCount(),
-      /*results=*/DimsToSymbols(offsets, tile_map_),
-      /*context=*/tile_map_.GetAffineMap().getContext());
+      /*dimCount=*/affine_map.getNumDims(),
+      /*symbolCount=*/affine_map.getNumSymbols() - tile_map_.GetRTVarsCount(),
+      /*results=*/
+      affine_map.getResults().slice(2 * component_size, component_size),
+      /*context=*/affine_map.getContext());
 }
 
 }  // namespace gpu

@@ -346,6 +346,7 @@ class ExecutableBuildOptions:
   use_auto_spmd_partitioning: bool
   auto_spmd_partitioning_mesh_shape: List[int]
   auto_spmd_partitioning_mesh_ids: List[int]
+  use_shardy_partitioner: bool
 
 class PrecisionConfig_Precision(enum.IntEnum):
   DEFAULT: int
@@ -670,7 +671,6 @@ class ExecuteResults:
 
 class LoadedExecutable:
   client: Client
-  def local_logical_device_ids(self) -> List[Tuple[int, int]]: ...
   def local_devices(self) -> List[Device]: ...
   def size_of_generated_code_in_bytes(self) -> int: ...
   def delete(self) -> None: ...
@@ -751,12 +751,19 @@ class Frame:
   function_name: str
   function_line_start: int
   line_num: int
+  def __init__(self,
+               file_name: str,
+               function_name: str,
+               function_line_start: int,
+               line_num: int): ...
   def __repr__(self) -> str: ...
 
 class Traceback:
   enabled: ClassVar[bool]
   @staticmethod
   def get_traceback() -> Traceback: ...
+  @staticmethod
+  def traceback_from_frames(frames: Sequence[Frame]) -> Any: ...
   frames: Sequence[Frame]
   def __str__(self) -> str: ...
   def as_python_traceback(self) -> Any: ...
